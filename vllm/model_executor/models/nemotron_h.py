@@ -1,23 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inference-only Bamba model."""
-# Added by the IBM Team, 2024
+
+# Adapted from https://github.com/vllm-project/vllm/blob/94d8ec8d2bcb4ec55e33022b313c7e978edf05e1/vllm/model_executor/models/bamba.py
+# Copyright 2024 HuggingFace Inc. team. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inference-only NemotronH model."""
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import BambaConfig
 
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+# from vllm.model_executor.layers.mamba.mamba2_metadata import (
+#     Mamba2Metadata, prepare_mamba2_metadata)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
     MambaMixer2, extra_groups_for_head_shards)
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -30,28 +47,29 @@ from vllm.model_executor.models.mamba_cache import (MambaCacheManager,
                                                     MambaCacheParams)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs import NemotronHConfig
 from vllm.utils import LayerBlockType
 
-from .interfaces import HasInnerState, IsHybrid, SupportsLoRA, SupportsPP
-from .utils import (is_pp_missing_parameter,
+from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, SupportsLoRA, SupportsPP,
+                         SupportsQuant, SupportsV0Only)
+from vllm.model_executor.models.utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
-
-class BambaMLP(nn.Module):
+class NemotronHMLP(nn.Module):
 
     def __init__(
         self,
-        config: BambaConfig,
+        config: NemotronHConfig,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
-            output_sizes=[config.intermediate_size] * 2,
+            output_sizes=[config.intermediate_size],
             bias=bias,
             quant_config=quant_config,
         )
@@ -61,48 +79,79 @@ class BambaMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
         )
-        if config.hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
-                             "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        self.act_fn = ReLUSquaredActivation()
 
-    def forward(self, x):
-        x, _ = self.gate_up_proj(x)
+    def forward(self, x: torch.Tensor):
+        x, _ = self.up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
 
-class BambaMixerDecoderLayer(nn.Module):
+class NemotronHMLPDecoderLayer(nn.Module):
 
-    def __init__(self,
-                 config: BambaConfig,
-                 layer_idx: int,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "") -> None:
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.config = config
-        self.mamba = MambaMixer2(hidden_size= config.hidden_size,
-                                ssm_state_size = config.mamba_d_state,
-                                conv_kernel_size = config.mamba_d_conv,
-                                intermediate_size = config.mamba_expand *\
-                                                    config.hidden_size,
-                                use_conv_bias = config.mamba_conv_bias,
-                                use_bias = config.mamba_proj_bias,
-                                n_groups=config.mamba_n_groups,
-                                num_heads=config.mamba_n_heads,
-                                head_dim=config.mamba_d_head,
-                                rms_norm_eps=config.rms_norm_eps,
-                                activation=config.hidden_act,
-                                chunk_size=config.mamba_chunk_size,
-                                quant_config=quant_config)
 
-        self.feed_forward = BambaMLP(config, quant_config=quant_config)
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(config.hidden_size,
-                                        eps=config.rms_norm_eps)
+        self.mixer = NemotronHMLP(
+            config, quant_config=quant_config, bias=config.mlp_bias
+        )
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+
+        hidden_states = self.mixer(hidden_states)
+        return hidden_states, residual
+
+
+class NemotronHMambaDecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.mixer = MambaMixer2(
+            hidden_size=config.hidden_size,
+            ssm_state_size=config.ssm_state_size,
+            conv_kernel_size=config.conv_kernel,
+            intermediate_size=config.expand * config.hidden_size,
+            use_conv_bias=config.use_conv_bias,
+            use_bias=config.use_bias,
+            n_groups=config.n_groups,
+            num_heads=config.mamba_num_heads,
+            head_dim=config.mamba_head_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            activation=config.mamba_hidden_act,
+            chunk_size=config.chunk_size,
+            quant_config=quant_config,
+        )
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -111,39 +160,31 @@ class BambaMixerDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         mamba_cache_params: MambaCacheParams,
         sequence_idx: Optional[torch.Tensor] = None,
+        # mamba2_metadata: Mamba2Metadata,
         **kwargs,
     ):
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.norm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mamba(hidden_states, attn_metadata,
-                                   mamba_cache_params, sequence_idx)
-        # Fully Connected
-        hidden_states, residual = self.pre_ff_layernorm(
-            hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+        # hidden_states = self.mixer(hidden_states, mamba_cache_params, mamba2_metadata)
+        hidden_states = self.mixer(hidden_states, attn_metadata, mamba_cache_params, sequence_idx)
         return hidden_states, residual
 
 
-class BambaAttentionDecoderLayer(nn.Module):
+class NemotronHAttention(nn.Module):
 
     def __init__(
         self,
-        config: BambaConfig,
+        config: NemotronHConfig,
         layer_idx: int,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -163,25 +204,6 @@ class BambaAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-
-        if hasattr(config, "partial_rotary_factor"):
-            rotary_dim = self.head_dim * config.partial_rotary_factor
-        elif hasattr(config, "attn_rotary_emb"):
-            rotary_dim = config.attn_rotary_emb  # for backward compatibility
-        else:
-            rotary_dim = self.head_dim  # default
-
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=rotary_dim,
-            max_position=max_position_embeddings,
-            rope_scaling=rope_scaling,
-            base=rope_theta,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),  # see impl of get_rope
-        )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -191,10 +213,12 @@ class BambaAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
-                                        config.hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config)
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
 
         self.attn = Attention(
             self.num_heads,
@@ -205,15 +229,8 @@ class BambaAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.feed_forward = BambaMLP(config, quant_config=quant_config)
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(config.hidden_size,
-                                        eps=config.rms_norm_eps)
-
-    def self_attention(
+    def forward(
         self,
-        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -221,11 +238,32 @@ class BambaAttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+class NemotronHAttentionDecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.mixer = NemotronHAttention(
+            config,
+            layer_idx,
+            cache_config,
+            quant_config,
+            prefix,
+        )
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -238,43 +276,42 @@ class BambaAttentionDecoderLayer(nn.Module):
     ):
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.norm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.self_attention(
+        hidden_states = self.mixer(            
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
-        # Fully Connected
-        hidden_states, residual = self.pre_ff_layernorm(
-            hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
 
 
 ALL_DECODER_LAYER_TYPES = {
-    "attention": BambaAttentionDecoderLayer,
-    "mamba": BambaMixerDecoderLayer
+    "M": NemotronHMambaDecoderLayer,
+    "-": NemotronHMLPDecoderLayer,
+    "*": NemotronHAttentionDecoderLayer,
 }
 
 
-class BambaModel(nn.Module):
+class NemotronHModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config: NemotronHConfig = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
 
         self.config = config
-        lora_vocab = ((lora_config.lora_extra_vocab_size *
-                       (lora_config.max_loras or 1)) if lora_config else 0)
+        lora_vocab = (
+            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
+            if lora_config
+            else 0
+        )
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
 
@@ -287,7 +324,8 @@ class BambaModel(nn.Module):
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
             layer_class = ALL_DECODER_LAYER_TYPES[
-                config.layers_block_type[layer_idx]]
+                config.hybrid_override_pattern[layer_idx]
+            ]
             return layer_class(
                 config,
                 layer_idx,
@@ -297,13 +335,13 @@ class BambaModel(nn.Module):
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers")
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
+            len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
 
-        self.final_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
+        self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -345,18 +383,21 @@ class BambaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         residual = None
-        num_attn = 0
+        num_non_mamba_layers = 0
+        num_attn_layers = 0
         for i in range(len(self.layers)):
             layer = self.layers[i]
             kv_cache = None
-            if isinstance(layer, BambaAttentionDecoderLayer):
-                kv_cache = kv_caches[num_attn]
-                num_attn += 1
-
             layer_mamba_cache_params = None
-            if isinstance(layer, BambaMixerDecoderLayer):
+            if isinstance(layer, NemotronHMambaDecoderLayer):
                 layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
-                    i - num_attn)
+                    i - num_non_mamba_layers
+                )
+            else:
+                if isinstance(layer, NemotronHAttentionDecoderLayer):
+                    kv_cache = kv_caches[num_attn_layers]
+                    num_attn_layers += 1
+                num_non_mamba_layers += 1
 
             hidden_states, residual = layer(
                 positions=positions,
@@ -365,6 +406,7 @@ class BambaModel(nn.Module):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 mamba_cache_params=layer_mamba_cache_params,
+                # mamba2_metadata=mamba2_metadata,
                 sequence_idx=seq_idx,
             )
 
@@ -373,11 +415,10 @@ class BambaModel(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        hidden_states, _ = self.final_layernorm(hidden_states, residual)
+        hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
-
-class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
+class NemotronHForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                        IsHybrid):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -409,14 +450,14 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         lora_config = vllm_config.lora_config
         scheduler_config = vllm_config.scheduler_config
         assert not cache_config.enable_prefix_caching, \
-            "Bamba currently does not support prefix caching"
+            "NemotronH currently does not support prefix caching"
 
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = BambaModel(vllm_config=vllm_config,
+        self.model = NemotronHModel(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
@@ -435,6 +476,7 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
 
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
+
         self.sampler = get_sampler()
 
         self.make_empty_intermediate_tensors = (
@@ -480,28 +522,28 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
 
         conv_state_shape, temporal_state_shape = None, None
 
-        intermediate_size = self.config.mamba_expand * hidden_size
+        intermediate_size = self.config.expand * hidden_size
 
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
-        n_groups = (self.config.mamba_n_groups + extra_groups_for_head_shards(
-            self.config.mamba_n_groups, world_size))
+        n_groups = (self.config.n_groups + extra_groups_for_head_shards(
+            self.config.n_groups, world_size))
 
         # - heads and n_groups are TP-ed
         conv_dim = (intermediate_size +
-                    2 * n_groups * self.config.mamba_d_state)
+                    2 * n_groups * self.config.ssm_state_size)
         conv_state_shape = (
             divide(conv_dim, world_size),
-            self.config.mamba_d_conv - 1,
+            self.config.conv_kernel - 1,
         )
 
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
         #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
         temporal_state_shape = (
-            divide(self.config.mamba_n_heads, world_size),
-            self.config.mamba_d_head,
-            self.config.mamba_d_state,
+            divide(self.config.mamba_num_heads, world_size),
+            self.config.mamba_head_dim,
+            self.config.ssm_state_size,
         )
         return conv_state_shape, temporal_state_shape
 
@@ -524,52 +566,52 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        # # update name in weights before passing to loader
+        # updated_weights = []
+        # for name, loaded_weight in weights:
+        #     name = name.replace("backbone", "model")
+        #     updated_weights.append((name, loaded_weight))
+        # loader = AutoWeightsLoader(self)
+        # return loader.load_weights(updated_weights)
+
+        attb_params_mapping = {
+            "q_proj": "q",
+            "k_proj": "k",
+            "v_proj": "v",
+        }
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
+            name = name.replace("backbone", "model")
+
+            if "embeddings" in name:
+                name = name.replace("embeddings", "embed_tokens")
 
             if "A_log" in name:
                 name = name.replace("A_log", "A")
+                loaded_weight = loaded_weight.to(torch.float32)
 
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            if "D" in name:
+                loaded_weight = loaded_weight.to(torch.float32)
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
+            if "dt_bias" in name:
+                loaded_weight = loaded_weight.to(torch.float32)
 
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip layers on other devices.
-                if is_pp_missing_parameter(name, self):
-                    continue
+            # load attn params
+            if any(proj in name for proj in ["q_proj", "k_proj", "v_proj"]):
+                weight_name = next(
+                    proj for proj in ["q_proj", "k_proj", "v_proj"] if proj in name
+                )
+                name = name.replace(weight_name, "qkv_proj")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
+                weight_loader(param, loaded_weight, attb_params_mapping[weight_name])
+            # load other params
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         return loaded_params

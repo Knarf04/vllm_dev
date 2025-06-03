@@ -18,6 +18,7 @@ from vllm.transformers_utils.configs.mllama import MllamaConfig
 from vllm.transformers_utils.configs.mlp_speculator import MLPSpeculatorConfig
 from vllm.transformers_utils.configs.mpt import MPTConfig
 from vllm.transformers_utils.configs.nemotron import NemotronConfig
+from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 from vllm.transformers_utils.configs.nvlm_d import NVLM_D_Config
 from vllm.transformers_utils.configs.olmo2 import Olmo2Config
 from vllm.transformers_utils.configs.solar import SolarConfig
@@ -40,6 +41,7 @@ __all__ = [
     "MllamaConfig",
     "MLPSpeculatorConfig",
     "NemotronConfig",
+    "NemotronHConfig",
     "NVLM_D_Config",
     "Olmo2Config",
     "SolarConfig",

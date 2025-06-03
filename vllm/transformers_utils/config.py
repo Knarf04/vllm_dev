@@ -35,8 +35,8 @@ from vllm.transformers_utils.configs import (ChatGLMConfig, Cohere2Config,
                                              InternVLChatConfig, JAISConfig,
                                              MedusaConfig, MllamaConfig,
                                              MLPSpeculatorConfig, MPTConfig,
-                                             NemotronConfig, NVLM_D_Config,
-                                             Olmo2Config, RWConfig,
+                                             NemotronConfig, NemotronHConfig,
+                                             NVLM_D_Config, Olmo2Config, RWConfig,
                                              SolarConfig, Telechat2Config,
                                              UltravoxConfig)
 # yapf: enable
