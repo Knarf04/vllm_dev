@@ -50,8 +50,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import NemotronHConfig
 from vllm.utils import LayerBlockType
 
-from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, SupportsLoRA, SupportsPP,
-                         SupportsQuant, SupportsV0Only)
+from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, 
+                         SupportsLoRA, SupportsPP, SupportsQuant)
 from vllm.model_executor.models.utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
