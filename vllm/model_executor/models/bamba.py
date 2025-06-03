@@ -573,3 +573,4 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+        

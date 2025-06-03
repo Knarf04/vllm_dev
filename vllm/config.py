@@ -525,7 +525,6 @@ class ModelConfig:
             "generate": ModelRegistry.is_text_generation_model(architectures),
             "pooling": ModelRegistry.is_pooling_model(architectures),
         }
-        print(runner_support)
         supported_runner_types_lst: List[RunnerType] = [
             runner_type
             for runner_type, is_supported in runner_support.items()

@@ -532,3 +532,4 @@ class MambaMixer2(CustomOp):
         # # 5. Final linear projection
         out, _ = self.out_proj(hidden_states)
         return out
+        
