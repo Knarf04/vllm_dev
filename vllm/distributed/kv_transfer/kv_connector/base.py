@@ -121,3 +121,5 @@ class KVConnectorBase(ABC):
         """
 
         raise NotImplementedError
+
+KVConnectorBaseType = Union[KVConnectorBase]

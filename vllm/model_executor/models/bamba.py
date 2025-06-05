@@ -7,17 +7,19 @@ import torch
 from torch import nn
 from transformers import BambaConfig
 
-from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba2_metadata import (
+    Mamba2Metadata, prepare_mamba2_metadata)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
     MambaMixer2, extra_groups_for_head_shards)
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -37,7 +39,6 @@ from .utils import (is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 class BambaMLP(nn.Module):
@@ -95,7 +96,6 @@ class BambaMixerDecoderLayer(nn.Module):
                                 head_dim=config.mamba_d_head,
                                 rms_norm_eps=config.rms_norm_eps,
                                 activation=config.hidden_act,
-                                chunk_size=config.mamba_chunk_size,
                                 quant_config=quant_config)
 
         self.feed_forward = BambaMLP(config, quant_config=quant_config)
@@ -107,10 +107,9 @@ class BambaMixerDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         mamba_cache_params: MambaCacheParams,
-        sequence_idx: Optional[torch.Tensor] = None,
+        mamba2_metadata: Mamba2Metadata,
         **kwargs,
     ):
         if residual is None:
@@ -120,8 +119,8 @@ class BambaMixerDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.mamba(hidden_states, attn_metadata,
-                                   mamba_cache_params, sequence_idx)
+        hidden_states = self.mamba(hidden_states, mamba_cache_params, mamba2_metadata)
+        
         # Fully Connected
         hidden_states, residual = self.pre_ff_layernorm(
             hidden_states, residual)
@@ -215,15 +214,13 @@ class BambaAttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -231,8 +228,6 @@ class BambaAttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         **kwargs,
     ):
@@ -246,8 +241,6 @@ class BambaAttentionDecoderLayer(nn.Module):
         hidden_states = self.self_attention(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
         )
         # Fully Connected
         hidden_states, residual = self.pre_ff_layernorm(
@@ -312,26 +305,19 @@ class BambaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        # kv_caches: List[torch.Tensor],
+        # attn_metadata: AttentionMetadata,
         mamba_cache_params: MambaCacheParams,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        # pass a sequence index tensor, that is required for
-        # proper continuous batching computation including
-        # chunked prefill
-        seq_idx = None
-        if attn_metadata.num_prefills > 0:
-            seq_idx = torch.zeros_like(input_ids, dtype=torch.int32)
-            for i, (srt, end) in enumerate(
-                    zip(
-                        attn_metadata.query_start_loc,
-                        attn_metadata.query_start_loc[1:],
-                    )):
-                seq_idx[srt:end] = i
-            seq_idx.unsqueeze_(0)
+        attn_metadata = get_forward_context().attn_metadata
+
+        mamba2_metadata = prepare_mamba2_metadata(
+            chunk_size=self.config.mamba_chunk_size,
+            attn_metadata=attn_metadata,
+        )
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -348,9 +334,7 @@ class BambaModel(nn.Module):
         num_attn = 0
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            kv_cache = None
             if isinstance(layer, BambaAttentionDecoderLayer):
-                kv_cache = kv_caches[num_attn]
                 num_attn += 1
 
             layer_mamba_cache_params = None
@@ -361,11 +345,9 @@ class BambaModel(nn.Module):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
                 residual=residual,
                 mamba_cache_params=layer_mamba_cache_params,
-                sequence_idx=seq_idx,
+                mamba2_metadata=mamba2_metadata,
             )
 
         if not get_pp_group().is_last_rank:
@@ -389,12 +371,6 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     }
 
     # LoRA specific attributes
-    supported_lora_modules = [
-        "qkv_proj",
-        "o_proj",
-        "embed_tokens",
-        "lm_head",
-    ]
     embedding_modules = {
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings",
@@ -446,8 +422,6 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     def forward(self,
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
-                kv_caches: List[KVCache],
-                attn_metadata: AttentionMetadata,
                 intermediate_tensors: Optional[IntermediateTensors] = None,
                 inputs_embeds: Optional[torch.Tensor] = None,
                 **kwargs):
@@ -460,8 +434,7 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                 self.vllm_config, self.lm_head.weight.dtype, num_mamba_layers,
                 *self._get_mamba_cache_shape())
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, mamba_cache_params,
+        hidden_states = self.model(input_ids, positions, mamba_cache_params,
                                    intermediate_tensors, inputs_embeds)
 
         return hidden_states
